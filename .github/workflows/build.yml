@@ -1,4 +1,3 @@
-
 name: Build AICompanion APK
 
 on:
@@ -7,6 +6,9 @@ on:
   pull_request:
     branches: [main, master]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -23,39 +25,106 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Gradle
+      - name: Set up Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
 
-      - name: Find Android project
-        id: project
+      - name: Extract Android project ZIP
         shell: bash
         run: |
-          echo "Repository files:"
-          ls -la
+          set -euo pipefail
 
-          SETTINGS=$(find . -maxdepth 6 -type f \
-            \( -name settings.gradle -o -name settings.gradle.kts \) \
-            -not -path '*/.gradle/*' | head -n 1)
+          ZIP_FILE='AICompanion (2).zip'
+          if [[ ! -f "$ZIP_FILE" ]]; then
+            ZIP_FILE="$(find . -maxdepth 1 -type f -iname '*.zip' -print -quit)"
+          fi
 
-          if [ -z "$SETTINGS" ]; then
-            echo "ERROR: No Gradle settings file found."
+          if [[ -z "$ZIP_FILE" || ! -f "$ZIP_FILE" ]]; then
+            echo 'ERROR: No project ZIP found in the repository root.'
+            ls -la
             exit 1
           fi
 
-          PROJECT_DIR=$(dirname "$SETTINGS")
-          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-          echo "Found Android project: $PROJECT_DIR"
+          echo "Extracting: $ZIP_FILE"
+          mkdir -p "$GITHUB_WORKSPACE/extracted-project"
+          unzip -oq "$ZIP_FILE" -d "$GITHUB_WORKSPACE/extracted-project"
 
-      - name: Build debug APK
-        working-directory: .
+          SETTINGS_FILE="$(find "$GITHUB_WORKSPACE/extracted-project" -maxdepth 10 -type f \
+            \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) \
+            -not -path '*/.gradle/*' -print -quit)"
+
+          if [[ -z "$SETTINGS_FILE" ]]; then
+            echo 'ERROR: ZIP was extracted, but no Gradle settings file was found.'
+            find "$GITHUB_WORKSPACE/extracted-project" -maxdepth 6 -type f -print | head -100
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+          if [[ ! -f "$PROJECT_DIR/build.gradle" && ! -f "$PROJECT_DIR/build.gradle.kts" ]]; then
+            echo "ERROR: Gradle settings found at $PROJECT_DIR, but no root build.gradle file is present."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Gradle project root: $PROJECT_DIR"
+
+      - name: Accept Android SDK licenses and install required packages
         shell: bash
         run: |
-          cd "${{ steps.project.outputs.project_dir }}"
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if [[ -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]]; then
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          else
+            SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path '*/bin/sdkmanager' -print 2>/dev/null | sort -V | tail -n 1)"
+          fi
+
+          if [[ -z "$SDKMANAGER" || ! -x "$SDKMANAGER" ]]; then
+            echo "ERROR: sdkmanager was not found under $SDK_ROOT/cmdline-tools."
+            find "$SDK_ROOT" -maxdepth 4 -type f -name sdkmanager -print 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "Using SDK root: $SDK_ROOT"
+          echo "Using sdkmanager: $SDKMANAGER"
+
+          # Disable pipefail for this pipeline so `yes` being closed by sdkmanager
+          # does not cause a false failure; sdkmanager's exit status is preserved.
+          set +o pipefail
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses
+          set -o pipefail
+
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
+            'platform-tools' \
+            'platforms;android-34' \
+            'build-tools;34.0.0'
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          echo "Building project in: $PWD"
+          gradle --version
           gradle assembleDebug --no-daemon
 
-      - name: Upload APK
+          APK_FILE="$(find "$PROJECT_DIR/app/build/outputs/apk/debug" -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          if [[ -z "$APK_FILE" ]]; then
+            echo 'ERROR: Gradle finished but no debug APK was found.'
+            find "$PROJECT_DIR" -path '*/build/outputs/apk/*' -type f -print || true
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/apk-output"
+          cp "$APK_FILE" "$GITHUB_WORKSPACE/apk-output/AICompanion-debug.apk"
+          echo "APK created: $GITHUB_WORKSPACE/apk-output/AICompanion-debug.apk"
+
+      - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
           name: AICompanion-debug-apk
-          path: '**/app/build/outputs/apk/debug/app-debug.apk'
+          path: apk-output/AICompanion-debug.apk
           if-no-files-found: error
+          retention-days: 14
