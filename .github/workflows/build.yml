@@ -1,14 +1,12 @@
+
 name: Build AICompanion APK
 
 on:
   push:
-    branches: ["main", "master"]
+    branches: [main, master]
   pull_request:
-    branches: ["main", "master"]
+    branches: [main, master]
   workflow_dispatch:
-
-permissions:
-  contents: read
 
 jobs:
   build:
@@ -19,31 +17,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
+      - name: Set up Java
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Set up Gradle 8.9
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.9"
 
-      # The uploaded ZIP has the Gradle project in AICompanion/AICompanion.
-      # If you upload the contents of that inner folder to the repository root,
-      # change this to: working-directory: .
+      - name: Accept Android SDK licenses
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses
+
       - name: Build debug APK
         working-directory: ./AICompanion/AICompanion
         run: gradle assembleDebug --no-daemon
 
-      - name: Upload debug APK
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: AICompanion-debug-apk
           path: AICompanion/AICompanion/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
-          retention-days: 14
