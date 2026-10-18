@@ -1,0 +1,157 @@
+name: Build AICompanion APK
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Assemble debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Extract Android project ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE='AICompanion (2).zip'
+          if [[ ! -f "$ZIP_FILE" ]]; then
+            ZIP_FILE="$(find . -maxdepth 1 -type f -iname '*.zip' -print -quit)"
+          fi
+
+          if [[ -z "$ZIP_FILE" || ! -f "$ZIP_FILE" ]]; then
+            echo 'ERROR: No project ZIP found in the repository root.'
+            ls -la
+            exit 1
+          fi
+
+          echo "Extracting: $ZIP_FILE"
+          mkdir -p "$GITHUB_WORKSPACE/extracted-project"
+          unzip -oq "$ZIP_FILE" -d "$GITHUB_WORKSPACE/extracted-project"
+
+          SETTINGS_FILE="$(find "$GITHUB_WORKSPACE/extracted-project" -maxdepth 10 -type f \
+            \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) \
+            -not -path '*/.gradle/*' -print -quit)"
+
+          if [[ -z "$SETTINGS_FILE" ]]; then
+            echo 'ERROR: ZIP was extracted, but no Gradle settings file was found.'
+            find "$GITHUB_WORKSPACE/extracted-project" -maxdepth 6 -type f -print | head -100
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+          if [[ ! -f "$PROJECT_DIR/build.gradle" && ! -f "$PROJECT_DIR/build.gradle.kts" ]]; then
+            echo "ERROR: Gradle settings found at $PROJECT_DIR, but no root build.gradle file is present."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Gradle project root: $PROJECT_DIR"
+
+      - name: Fix mismatched CatView source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          INNER_ZIP="$GITHUB_WORKSPACE/extracted-project/AICompanion.zip"
+          TARGET="$PROJECT_DIR/app/src/main/java/com/example/companion/CatView.kt"
+          TEMP_FILE="$(mktemp)"
+
+          if [[ ! -f "$INNER_ZIP" ]]; then
+            echo "ERROR: Expected nested source archive was not found: $INNER_ZIP"
+            exit 1
+          fi
+
+          # FloatingService.kt and MainActivity.kt use CatView.Mood. The outer
+          # archive contains a different CatView.kt using an undefined CatState.
+          unzip -p "$INNER_ZIP" \
+            'AICompanion/app/src/main/java/com/example/companion/CatView.kt' > "$TEMP_FILE"
+
+          grep -q 'enum class Mood' "$TEMP_FILE"
+          grep -q 'var mood:' "$TEMP_FILE"
+          grep -q 'var facingLeft:' "$TEMP_FILE"
+
+          install -m 644 "$TEMP_FILE" "$TARGET"
+          rm -f "$TEMP_FILE"
+          echo "Replaced mismatched CatView.kt with the matching source from the nested project archive."
+
+      - name: Accept Android SDK licenses and install required packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if [[ -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]]; then
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          else
+            SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path '*/bin/sdkmanager' -print 2>/dev/null | sort -V | tail -n 1)"
+          fi
+
+          if [[ -z "$SDKMANAGER" || ! -x "$SDKMANAGER" ]]; then
+            echo "ERROR: sdkmanager was not found under $SDK_ROOT/cmdline-tools."
+            find "$SDK_ROOT" -maxdepth 4 -type f -name sdkmanager -print 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "Using SDK root: $SDK_ROOT"
+          echo "Using sdkmanager: $SDKMANAGER"
+
+          # Disable pipefail for this pipeline so `yes` being closed by sdkmanager
+          # does not cause a false failure; sdkmanager's exit status is preserved.
+          set +o pipefail
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses
+          set -o pipefail
+
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
+            'platform-tools' \
+            'platforms;android-34' \
+            'build-tools;34.0.0'
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          echo "Building project in: $PWD"
+          gradle --version
+          gradle assembleDebug --no-daemon
+
+          APK_FILE="$(find "$PROJECT_DIR/app/build/outputs/apk/debug" -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          if [[ -z "$APK_FILE" ]]; then
+            echo 'ERROR: Gradle finished but no debug APK was found.'
+            find "$PROJECT_DIR" -path '*/build/outputs/apk/*' -type f -print || true
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/apk-output"
+          cp "$APK_FILE" "$GITHUB_WORKSPACE/apk-output/AICompanion-debug.apk"
+          echo "APK created: $GITHUB_WORKSPACE/apk-output/AICompanion-debug.apk"
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AICompanion-debug-apk
+          path: apk-output/AICompanion-debug.apk
+          if-no-files-found: error
+          retention-days: 14
